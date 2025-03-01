@@ -34,12 +34,12 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      // char *pa = kalloc();
+      // if(pa == 0)
+      //   panic("kalloc");
+      // uint64 va = KSTACK((int) (p - proc));
+      // kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      // p->kstack = va;
   }
   kvminithart();
 }
@@ -120,6 +120,24 @@ found:
     release(&p->lock);
     return 0;
   }
+  
+  // kernel page table 
+  p->kernelpt = proc_kpt_init(p);
+  if(p->kernelpt == 0)
+  {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  char *pa = kalloc();
+  if(pa == 0){
+    panic("kernel page table kalloc");
+  }
+  uint64 va = KSTACK((int)(p - proc));
+  //uint64 va = KSTACK(0);
+  uvmmap(p->kernelpt, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
@@ -150,6 +168,19 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  
+  if(p->kstack)
+    {
+      uvmunmap(p->kernelpt, p->kstack, 1, 1);
+    }
+  p->kstack = 0;
+  
+
+  //内核栈需要在kernelpt之前清除
+  if(p->kernelpt){
+    proc_freekernelpt(p->kernelpt);
+  }
+  p->kernelpt = 0;
 }
 
 // Create a user page table for a given process,
@@ -221,6 +252,8 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  u2kvmcopy(p->pagetable, p->kernelpt, 0, p->sz);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -243,9 +276,13 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    if(PGROUNDUP(sz + n) >= PLIC){
+      return -1;
+    }
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    u2kvmcopy(p->pagetable, p->kernelpt, sz-n, sz);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
@@ -294,7 +331,9 @@ fork(void)
   pid = np->pid;
 
   np->state = RUNNABLE;
-
+  
+  //
+  u2kvmcopy(np->pagetable, np->kernelpt, 0, np->sz);
   release(&np->lock);
 
   return pid;
@@ -473,8 +512,15 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // Store the proc kernel page table into SATP 
+        proc_inithart(p->kernelpt);
+
         swtch(&c->context, &p->context);
 
+
+        // Come back to the global kernel page table
+        
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
@@ -486,6 +532,7 @@ scheduler(void)
 #if !defined (LAB_FS)
     if(found == 0) {
       intr_on();
+      kvminithart();
       asm volatile("wfi");
     }
 #else
@@ -697,3 +744,15 @@ procdump(void)
     printf("\n");
   }
 }
+
+void
+procnum(uint64 *dst)
+{
+    *dst = 0;
+    struct proc *p;
+    for(p = proc; p < &proc[NPROC]; p++){
+       if(p->state != UNUSED)
+          (*dst)++;
+    }
+}
+
